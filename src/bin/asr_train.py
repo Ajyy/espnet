@@ -40,6 +40,8 @@ def main():
     # multilingual transfer learning
     parser.add_argument('--modify-output', '-m', default='false', type=bool,
                         help='Wehether to modify output layer to new language')
+    parser.add_argument('--adaptdir', type=str, required=True,
+                        help='Adapt directory')
     parser.add_argument('--adapt', '-a', type=bool, default=False,
                         help='retrain/adapt from the exisitng best model')
     parser.add_argument('--adapt-layer-names', '-l', type=str, default="AttCtcOut",
@@ -218,6 +220,19 @@ def main():
                 cvd = subprocess.check_output(["/usr/local/bin/free-gpu", "-n", str(args.ngpu)]).decode().strip()
                 logging.info('CLSP: use gpu' + cvd)
                 os.environ['CUDA_VISIBLE_DEVICES'] = cvd
+            elif "fit.vutbr.cz" in subprocess.check_output(["hostname", "-f"]).decode():
+                logging.warn("check fit")
+                command = 'nvidia-smi --query-gpu=memory.free,memory.total \
+                --format=csv |tail -n+2| awk \'BEGIN{FS=" "}{if ($1/$3 > 0.98) print NR-1}\''
+                try:
+                    cvd = str(subprocess.check_output(command, shell=True).decode().strip().rsplit('\n')[0:args.ngpu])
+                    cvd = cvd.replace("]", "")
+                    cvd = cvd.replace("[", "")
+                    cvd = cvd.replace("'", "")
+                    logging.warn(cvd)
+                    os.environ['CUDA_VISIBLE_DEVICES'] = cvd
+                except subprocess.CalledProcessError:
+                    logging.info("No GPU seems to be available")
 
         cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
         if cvd is None:
