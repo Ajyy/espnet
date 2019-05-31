@@ -3,7 +3,6 @@
 # Copyright 2017 Tomoki Hayashi (Nagoya University)
 #  Apache 2.0  (http://www.apache.org/licenses/LICENSE-2.0)
 
-
 import argparse
 import logging
 import os
@@ -13,7 +12,6 @@ import subprocess
 import sys
 
 import numpy as np
-
 
 def main():
     parser = argparse.ArgumentParser()
@@ -157,12 +155,54 @@ def main():
                         help='Gradient norm threshold to clip')
     parser.add_argument('--num-save-attention', default=3, type=int,
                         help='Number of samples of attention to be saved')
+    parser.add_argument('--phoneme_objective_weight', default=0.0, type=float,
+                        help='Train with an additional phoneme transcription objective if weight > 0')
+    parser.add_argument('--phoneme_objective_layer', default=None,
+                        help='The layer of the BLSTM encoder to connect to the phoneme objective')
+    parser.add_argument('--predict_lang', type=str, default=None,
+                        help="""If "normal", then the model predicts languages as
+                        well. If "adv", then the model predicts languages, but
+                        adversarially; trying to learn to create a hidden
+                        representation that makes it hard to predict the
+                        language from""")
+    parser.add_argument('--predict_lang_alpha', default=None, type=float,
+                        help='The amount to scale the adversarial gradient.')
+    parser.add_argument('--predict_lang_alpha_scheduler', default="ganin",
+                        type=str, help="""The name of the language prediction
+                        learning rate scaling factor. Options include 'ganin'
+                        to use the logarithmic scaling of Ganin et al 2016""")
+    parser.add_argument('--no_restore_trainer',
+                        dest='restore_trainer', action='store_false',
+                        help='Restore the same training iterator used before')
+    parser.add_argument('--langs_file', type=str, default=None,
+                        help='Filename for the list of languages.')
+    parser.add_argument('--adapt', dest='adapt', action='store_true',
+                        help='Flag that language adaptation is occurring')
+    parser.add_argument('--adapt_no_phoneme', action='store_true',
+                        help="flag to not use phoneme objective during adaptation if applicable")
+    parser.add_argument('--pretrained-model', default=False, nargs='?',
+                        help='Pre-trained ASR model')
     args = parser.parse_args()
+    logging.info(args)
+
+    if args.predict_lang_alpha and args.predict_lang_alpha_scheduler:
+        # Then complain because only one of these should be set
+        raise ValueError("""predict_lang_alpha ({}) and
+            predict_lang_alpha_scheduler ({}) cannot both be set. Choose just
+            one.""".format(args.predict_lang_alpha,
+                           args.predict_lang_alpha_scheduler))
+
+    try:
+        args.phoneme_objective_layer = int(args.phoneme_objective_layer)
+    except TypeError, ValueError:
+        pass
+
 
     # logging info
     if args.verbose > 0:
         logging.basicConfig(
             level=logging.INFO, format='%(asctime)s (%(module)s:%(lineno)d) %(levelname)s: %(message)s')
+        logging.getLogger().setLevel(logging.INFO)
     else:
         logging.basicConfig(
             level=logging.WARN, format='%(asctime)s (%(module)s:%(lineno)d) %(levelname)s: %(message)s')

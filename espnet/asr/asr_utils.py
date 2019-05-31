@@ -53,6 +53,7 @@ def make_batchset(data, batch_size, max_length_in, max_length_out,
 
     # make list of minibatches
     minibatches = []
+
     start = 0
     while True:
         ilen = int(sorted_data[start][1]['input'][0]['shape'][0])
@@ -84,22 +85,63 @@ def make_batchset(data, batch_size, max_length_in, max_length_out,
 
     return minibatches
 
+def get_output(output_name, utter):
+    """ Returns the output corresponding to a given output name, for when there
+    are multiple outputs. Example output_names include "grapheme" and
+    "phn" (phoneme).
 
-def load_inputs_and_targets(batch):
+    Better would be to have json[utter_name]["output"] be a dictionary, but for
+    now this function is to remove hardcoding of magic numbers like 0 for
+    graphemes."""
+
+    for output in utter["output"]:
+        if output["name"] == output_name:
+            return output["tokenid"].split()
+
+    # If we're here, something has likely gone wrong
+    logging.warn("output_name ({}) not found for utter ({})".format(
+            output_name, utter))
+
+# TODO This is very corpus-specific. Really this sort of think should go in the
+# mkjson.py recipe so that the language is a field in data.json.
+def uttid2lang(uttid):
+    """ Returns the language given an utterance ID. Utterance IDs look
+    something like this: "105_94168_A_20120127_071423_043760-turkish". Given
+    this input, the output would be "turkish"
+    """
+    #return uttid.split("-")[-1]
+
+    """ Changing this so we deal with lang-codes at the start of the uttid. In
+    the above example it would be 105."""
+    #return uttid.split("_")[0]
+
+    """ For the CMU Wilderness dataset, its more like
+        B27___22_Revelation__SWESFVN2DA_00028 """
+
+    #lang = uttid.split("_")[-2][:6]
+    lang = uttid[-16:-10]
+
+    logging.info("Extracting langcode from uttid: {} -> {}".format(uttid, lang))
+
+    return lang
+
+def load_inputs_and_targets(batch, phoneme_objective_weight, lang2id):
     """Function to load inputs and targets from list of dicts
 
     :param list batch: list of dict which is subset of loaded data.json
     :return: list of input feature sequences [(T_1, D), (T_2, D), ..., (T_B, D)]
     :rtype: list of float ndarray
-    :return: list of target token id sequences [(L_1), (L_2), ..., (L_B)]
+    :return: list of target grapheme token id sequences [(L_1), (L_2), ..., (L_B)]
+    :rtype: list of int ndarray
+    :return: list of target phoneme token id sequences [(L_1), (L_2), ..., (L_B)]
     :rtype: list of int ndarray
     """
     # load acoustic features and target sequence of token ids
     xs = [kaldi_io_py.read_mat(b[1]['input'][0]['feat']) for b in batch]
-    ys = [b[1]['output'][0]['tokenid'].split() for b in batch]
+    grapheme_ys = [get_output("grapheme", b[1]) for b in batch]
 
     # get index of non-zero length samples
-    nonzero_idx = filter(lambda i: len(ys[i]) > 0, range(len(xs)))
+    nonzero_idx = filter(lambda i: len(grapheme_ys[i]) > 0, range(len(xs)))
     # sort in input lengths
     nonzero_sorted_idx = sorted(nonzero_idx, key=lambda i: -len(xs[i]))
     if len(nonzero_sorted_idx) != len(xs):
@@ -108,10 +150,36 @@ def load_inputs_and_targets(batch):
 
     # remove zero-length samples
     xs = [xs[i] for i in nonzero_sorted_idx]
-    ys = [np.fromiter(map(int, ys[i]), dtype=np.int64) for i in nonzero_sorted_idx]
+    grapheme_ys = [np.fromiter(map(int, grapheme_ys[i]), dtype=np.int64) for i in nonzero_sorted_idx]
 
-    return xs, ys
+    # Gather phoneme targets
+    if phoneme_objective_weight > 0.0:
+        phoneme_ys = [get_output("phn", b[1]) for b in batch]
+        phoneme_ys = [np.fromiter(map(int, phoneme_ys[i]), dtype=np.int64) for i in nonzero_sorted_idx]
+    else:
+        phoneme_ys = None
 
+
+    # Gather language targets
+    uttids = [b[0] for b in batch]
+    uttids = [uttids[i] for i in nonzero_sorted_idx]
+    logging.info("uttids: {}".format(uttids))
+    try:
+        lang_ys = np.fromiter([lang2id[uttid2lang(uttid)] for uttid in uttids],
+                              dtype=np.int64)
+    except TypeError:
+        # Then the language of the utterance isn't in our list of languages, or
+        # we don't even have a list of languages. In which case language
+        # prediction shouldn't be part for training.
+        lang_ys = None
+    except KeyError:
+        # Then the language of the utterance isn't in our list of languages, or
+        # we don't even have a list of languages. In which case language
+        # prediction shouldn't be part for training.
+        lang_ys = None
+    logging.info("lang_ys: {}".format(lang_ys))
+
+    return xs, grapheme_ys, phoneme_ys, lang_ys
 
 # * -------------------- chainer extension related -------------------- *
 class CompareValueTrigger(object):
@@ -181,8 +249,8 @@ class PlotAttentionReport(extension.Extension):
             os.makedirs(self.outdir)
 
     def __call__(self, trainer):
-        batch = self.converter([self.converter.transform(self.data)], self.device)
-        att_ws = self.att_vis_fn(*batch)
+        xs_pad, ilens, grapheme_ys_pad, phoneme_ys_pad, lang_ys = self.converter([self.converter.transform(self.data)], self.device)
+        att_ws = self.att_vis_fn(xs_pad, ilens, grapheme_ys_pad, phoneme_ys_pad)
         for idx, att_w in enumerate(att_ws):
             filename = "%s/%s.ep.{.updater.epoch}.png" % (
                 self.outdir, self.data[idx][0])
@@ -391,18 +459,25 @@ def torch_load(path, model):
     del model_state_dict
 
 
-def torch_resume(snapshot_path, trainer):
+def torch_resume(snapshot_path, trainer, restore_trainer):
     """Function to resume from snapshot for pytorch
 
     :param str snapshot_path: snapshot file path
     :param instance trainer: chainer trainer instance
+    :param bool restore_trainer: Resume training with the same chainer Trainer
+    that was used for initial model training. Set to false if adapting with a
+    different trainer.
     """
     # load snapshot
+    logging.info("snapshot_path: {}".format(snapshot_path))
     snapshot_dict = torch.load(snapshot_path, map_location=lambda storage, loc: storage)
+    logging.info("snapshot_dict: {}".format(snapshot_dict))
 
-    # restore trainer states
-    d = NpzDeserializer(snapshot_dict['trainer'])
-    d.load(trainer)
+    logging.info(restore_trainer)
+    if restore_trainer:
+        # restore trainer states
+        d = NpzDeserializer(snapshot_dict['trainer'])
+        d.load(trainer)
 
     # restore model states
     if hasattr(trainer.updater.model, "model"):
@@ -417,6 +492,7 @@ def torch_resume(snapshot_path, trainer):
             trainer.updater.model.module.load_state_dict(snapshot_dict['model'])
         else:
             trainer.updater.model.load_state_dict(snapshot_dict['model'])
+            #trainer.updater.model.load_state_dict(snapshot_dict)
 
     # retore optimizer states
     trainer.updater.get_optimizer('main').load_state_dict(snapshot_dict['optimizer'])
@@ -448,7 +524,7 @@ def parse_hypothesis(hyp, char_list):
     return text, token, tokenid, score
 
 
-def add_results_to_json(js, nbest_hyps, char_list):
+def add_results_to_json(js, nbest_hyps, char_list, output_type):
     """Function to add N-best results to json
 
     :param dict js: groundtruth utterance dict
@@ -465,24 +541,26 @@ def add_results_to_json(js, nbest_hyps, char_list):
         # parse hypothesis
         rec_text, rec_token, rec_tokenid, score = parse_hypothesis(hyp, char_list)
 
-        # copy ground-truth
-        out_dic = dict(js['output'][0].items())
+        for output in js['output']:
+            if output['name'] == output_type:
+                # copy ground-truth
+                out_dic = dict(output.items())
 
-        # update name
-        out_dic['name'] += '[%d]' % n
+                # update name
+                out_dic['name'] += '[%d]' % n
 
-        # add recognition results
-        out_dic['rec_text'] = rec_text
-        out_dic['rec_token'] = rec_token
-        out_dic['rec_tokenid'] = rec_tokenid
-        out_dic['score'] = score
+                # add recognition results
+                out_dic['rec_text'] = rec_text
+                out_dic['rec_token'] = rec_token
+                out_dic['rec_tokenid'] = rec_tokenid
+                out_dic['score'] = score
 
-        # add to list of N-best result dicts
-        new_js['output'].append(out_dic)
+                # add to list of N-best result dicts
+                new_js['output'].append(out_dic)
 
-        # show 1-best result
-        if n == 1:
-            logging.info('groundtruth: %s' % out_dic['text'])
-            logging.info('prediction : %s' % out_dic['rec_text'])
+                # show 1-best result
+                if n == 1:
+                    logging.info('groundtruth: %s' % out_dic['text'])
+                    logging.info('prediction : %s' % out_dic['rec_text'])
 
     return new_js

@@ -37,4 +37,8 @@ tools/chainer_ctc*
 tools/warp-ctc*
 tools/sentencepiece/*
 tools/moses
+
+.pytest_cache
+langname_phoneme_ali.txt
+*.swp
 tools/*.done

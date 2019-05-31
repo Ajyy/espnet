@@ -5,10 +5,12 @@
 
 
 import copy
+from collections import defaultdict
 import json
 import logging
 import math
 import os
+import subprocess
 
 # chainer related
 import chainer
@@ -34,6 +36,7 @@ from espnet.asr.asr_utils import torch_load
 from espnet.asr.asr_utils import torch_resume
 from espnet.asr.asr_utils import torch_save
 from espnet.asr.asr_utils import torch_snapshot
+from espnet.asr.asr_utils import uttid2lang
 from espnet.nets.e2e_asr_th import E2E
 from espnet.nets.e2e_asr_th import Loss
 from espnet.nets.e2e_asr_th import pad_list
@@ -85,25 +88,51 @@ class CustomEvaluator(extensions.Evaluator):
                     # read scp files
                     # x: original json with loaded features
                     #    will be converted to chainer variable later
-                    x = self.converter(batch, self.device)
-                    self.model(*x)
+                    xs_pad, ilens, grapheme_ys_pad, phoneme_ys_pad, lang_ys = self.converter(batch, self.device)
+                    self.model(xs_pad, ilens, grapheme_ys_pad, phoneme_ys_pad)
                 summary.add(observation)
         self.model.train()
 
         return summary.compute_mean()
 
+def ganin_lambda(epoch, total_epochs):
+    """ Sets the domain adaptation scaling factor on the basis of Ganin et al.
+    2016. The learning rate progresses from 0 to 1 in a non-linear logarithmic
+    manner."""
+    progress = epoch / float(total_epochs)
+    logging.info("Progress as decimal: {}".format(progress))
+    lambda_ = 2/(1 + np.exp(-10*progress)) - 1
+    logging.info("Ganin lambda: {}".format(lambda_))
+    return lambda_
+
+def shinohara_lambda(epoch, lambda_max=0.1):
+    """ Sets the domain adaptation scaling factor on the basis of Shinohara
+    2016. The learning rate progresses from 0 to lambda_max in a linear
+    manner."""
+
+    lambda_ = min(epoch/float(10), 1)*lambda_max
+    logging.info("Shinohara lambda: {}".format(lambda_))
+    return lambda_
 
 class CustomUpdater(training.StandardUpdater):
     '''Custom updater for pytorch'''
 
     def __init__(self, model, grad_clip_threshold, train_iter,
-                 optimizer, converter, device, ngpu):
+                 optimizer, converter, device, ngpu, num_epochs,
+                 predict_lang=None, predict_lang_alpha=None,
+                 predict_lang_alpha_scheduler=None,
+                 adapt=None):
         super(CustomUpdater, self).__init__(train_iter, optimizer)
         self.model = model
         self.grad_clip_threshold = grad_clip_threshold
         self.converter = converter
         self.device = device
         self.ngpu = ngpu
+        self.predict_lang = predict_lang
+        self.predict_lang_alpha = predict_lang_alpha
+        self.predict_lang_alpha_scheduler = predict_lang_alpha_scheduler
+        self.adapt = adapt
+        self.num_epochs = num_epochs
 
     # The core part of the update routine can be customized by overriding.
     def update_core(self):
@@ -114,15 +143,15 @@ class CustomUpdater(training.StandardUpdater):
 
         # Get the next batch ( a list of json files)
         batch = train_iter.next()
-        x = self.converter(batch, self.device)
-
+        xs_pad, ilens, grapheme_ys_pad, phoneme_ys_pad, lang_ys = self.converter(batch, self.device)
         # Compute the loss at this time step and accumulate it
         optimizer.zero_grad()  # Clear the parameter gradients
         if self.ngpu > 1:
-            loss = 1. / self.ngpu * self.model(*x)
+            loss = 1. / self.ngpu * self.model(xs_pad, ilens, grapheme_ys_pad,
+                                               phoneme_ys_pad)
             loss.backward(loss.new_ones(self.ngpu))  # Backprop
         else:
-            loss = self.model(*x)
+            loss = self.model(xs_pad, ilens, grapheme_ys_pad, phoneme_ys_pad)
             loss.backward()  # Backprop
         loss.detach()  # Truncate the graph
         # compute the gradient norm to check if it is normal or not
@@ -134,21 +163,87 @@ class CustomUpdater(training.StandardUpdater):
         else:
             optimizer.step()
 
+        logging.info("predict_lang: {}".format(self.predict_lang))
+        logging.info("predict_lang_alpha: {}".format(self.predict_lang_alpha))
+        logging.info("epoch: {}".format(self.epoch))
+        logging.info("epoch_detail: {}".format(self.epoch_detail))
+        logging.info("is_new_epoch: {}".format(self.is_new_epoch))
+        logging.info("previous_epoch_detail: {}".format(self.previous_epoch_detail))
+        if self.adapt:
+            # Then don't do language-based prediction and learning
+            logging.info("Don't do language-based prediction and learning.")
+            return
+        if self.predict_lang: # Either normal prediction or adversarial
+            # Now compute the lang loss (this redoes the encoding, which may be
+            # slightly inefficient but should be fine for now).
+            # (If performing adaptation, then we don't do adversarial language
+            # prediction)
+            optimizer.zero_grad()
+            if self.ngpu > 1:
+                lang_loss = 1. / self.ngpu * self.model.forward_langid(xs_pad, ilens, lang_ys)
+                lang_loss.backward(torch.ones(self.ngpu))  # Backprop
+            else:
+                lang_loss = self.model.forward_langid(xs_pad, ilens, lang_ys)
+                lang_loss.backward()  # Backprop
+            lang_loss.detach()  # Truncate the graph
+            logging.info("predict_lang: {}".format(self.predict_lang))
+
+
+            if self.predict_lang == "adv":
+                if self.predict_lang_alpha_scheduler == "ganin":
+                    lambda_ = ganin_lambda(self.epoch, self.num_epochs)
+                elif self.predict_lang_alpha_scheduler == "shinohara":
+                    lambda_ = shinohara_lambda(self.epoch)
+                elif self.predict_lang_alpha:
+                    lambda_ = self.predict_lang_alpha
+                    logging.info("Fixed lambda: {}".format(lambda_))
+                else:
+                    raise ValueError("""predict_lang_alpha_scheduler ({}) or
+                        predict_lang_alpha ({}) not set to a valid
+                        option.""".format(self.predict_lang_alpha_scheduler,
+                                          self.predict_lang_alpha))
+                if lambda_ != 0.0:
+                    # Then it's adversarial and we should reverse gradients
+                    for name, parameter in self.model.named_parameters():
+                        logging.info("lambda_: {}".format(lambda_))
+                        logging.info("name, parameter: {}".format(name, parameter))
+                        logging.info("parameter.grad: {}".format(parameter.grad))
+                        parameter.grad *= -1 * lambda_
+
+                    # But reverse the lang_linear gradients again so that
+                    # they're not adversarial (we just want the encoder to hide
+                    # the language information, but we still want to try our
+                    # best to predict the language)
+                    self.model.lang_linear.bias.grad *= (-1 / lambda_)
+                    self.model.lang_linear.weight.grad *= (-1 / lambda_)
+
+            optimizer.step()
+
 
 class CustomConverter(object):
     """CUSTOM CONVERTER"""
 
-    def __init__(self, subsamping_factor=1):
-        self.subsamping_factor = subsamping_factor
+    def __init__(self, phoneme_objective_weight, langs, subsamping_factor=1):
         self.ignore_id = -1
+        self.phoneme_objective_weight = phoneme_objective_weight
+        self.subsamping_factor = subsamping_factor
+        self.langs = langs
+        if self.langs:
+            self.lang2id = {lang: id_ for id_, lang in enumerate(self.langs)}
+            self.id2lang = {id_: lang for id_, lang in enumerate(self.langs)}
+        else:
+            self.lang2id = None
+            self.id2lang = None
 
     def transform(self, item):
-        return load_inputs_and_targets(item)
+        return load_inputs_and_targets(
+                item, self.phoneme_objective_weight,
+                self.lang2id)
 
     def __call__(self, batch, device):
         # batch should be located in list
         assert len(batch) == 1
-        xs, ys = batch[0]
+        xs, grapheme_ys, phoneme_ys, lang_ys = batch[0]
 
         # perform subsamping
         if self.subsamping_factor > 1:
@@ -160,10 +255,63 @@ class CustomConverter(object):
         # perform padding and convert to tensor
         xs_pad = pad_list([torch.from_numpy(x).float() for x in xs], 0).to(device)
         ilens = torch.from_numpy(ilens).to(device)
-        ys_pad = pad_list([torch.from_numpy(y).long() for y in ys], self.ignore_id).to(device)
+        grapheme_ys_pad = pad_list([torch.from_numpy(y).long() for y in grapheme_ys], self.ignore_id).to(device)
 
-        return xs_pad, ilens, ys_pad
+        if self.phoneme_objective_weight > 0.0:
+            assert phoneme_ys
+            phoneme_ys_pad = pad_list([torch.from_numpy(y).long() for y in phoneme_ys], self.ignore_id).to(device)
+        else:
+            phoneme_ys_pad = None
 
+        # lang_ys may be None if we don't want to train language prediction.
+        if lang_ys is not None:
+            lang_ys = torch.from_numpy(lang_ys).long().to(device)
+
+        return xs_pad, ilens, grapheme_ys_pad, phoneme_ys_pad, lang_ys
+
+class EspnetException(Exception):
+    pass
+
+class NoOdimException(EspnetException):
+    pass
+
+def get_odim(output_name, valid_json):
+    """ Return the output dimension for a given output type.
+    For example, output type might be 'phn' (phonemes) or 'grapheme'.
+
+    Note this is based off the first utterance, so it's assumed the output
+    dimension doesn't change across utterances in the JSON."""
+
+    utts = list(valid_json.keys())
+    for output in valid_json[utts[0]]['output']:
+        if output['name'] == output_name:
+            return int(output['shape'][1])
+    # Raise an exception because we couldn't find the odim
+    raise NoOdimException("Couldn't determine output dimension (odim) for output named '{}'".format(output_name))
+
+def extract_langs(json):
+    """ Determines the number of output languages."""
+
+    # Create a list of languages observed by taking them from the utterance
+    # name.
+    utts = list(json.keys())
+    langs = set()
+    for utt in utts:
+        langs.add(uttid2lang(utt))
+    return langs
+
+def get_output(output_name, utterance_name, json):
+    """ Returns the dictionary corresponding to a given output_name in some
+    espnet utterance JSON. For example. Example output_names include "grapheme" and
+    "phn" (phoneme).
+
+    Better would be to have json[utter_name]["output"] be a dictionary, but this
+    function is to remove hardcoding of magic numbers like 0 for graphemes."""
+
+    utts = list(json.keys())
+    for output in json[utterance_name]["output"]:
+        if output["name"] == output_name:
+            return output
 
 def train(args):
     '''Run training'''
@@ -188,14 +336,32 @@ def train(args):
     if not torch.cuda.is_available():
         logging.warning('cuda is not available')
 
-    # get input and output dimension info
+    # read json data
+    with open(args.train_json, 'rb') as f:
+        train_json = json.load(f)['utts']
     with open(args.valid_json, 'rb') as f:
         valid_json = json.load(f)['utts']
+
+    #langs = extract_langs(train_json)
+    #langs = langs.union(set(range(20)))
+    if args.langs_file:
+        langs = set()
+        with open(args.langs_file) as f:
+            for line in f:
+                langs.add(unicode(line.strip()))
+        logging.error(langs)
+    else:
+        langs = None
+
     utts = list(valid_json.keys())
     idim = int(valid_json[utts[0]]['input'][0]['shape'][1])
-    odim = int(valid_json[utts[0]]['output'][0]['shape'][1])
+    grapheme_odim = get_odim("grapheme", valid_json)
     logging.info('#input dims : ' + str(idim))
-    logging.info('#output dims: ' + str(odim))
+    logging.info('#grapheme output dims: ' + str(grapheme_odim))
+    phoneme_odim = -1
+    if args.phoneme_objective_weight > 0.0:
+        phoneme_odim = get_odim("phn", valid_json)
+        logging.info('#phoneme output dims: ' + str(phoneme_odim))
 
     # specify attention, CTC, hybrid mode
     if args.mtlalpha == 1.0:
@@ -207,10 +373,53 @@ def train(args):
     else:
         mtl_mode = 'mtl'
         logging.info('Multitask learning mode')
+    if args.phoneme_objective_weight > 0.0:
+        logging.info('Training with an additional phoneme transcription objective.')
 
-    # specify model architecture
-    e2e = E2E(idim, odim, args)
-    model = Loss(e2e, args.mtlalpha)
+    if args.pretrained_model:
+        logging.info("Reading a pretrained model from " + args.pretrained_model)
+        train_idim, train_odim, phoneme_odim, train_args = get_model_conf(args.pretrained_model)
+
+        if train_args.phoneme_objective_weight > 0.0:
+            e2e = E2E(train_idim, train_odim, train_args, phoneme_odim=phoneme_odim)
+        else:
+            e2e = E2E(train_idim, train_odim, train_args)
+
+        if train_args.langs_file:
+            langs = set()
+            with open(args.langs_file) as f:
+                for line in f:
+                    langs.add(unicode(line.strip()))
+            logging.error(langs)
+        else:
+            langs = None
+
+        if args.adapt_no_phoneme:
+            # Use the grapheme objective only for adaptation
+            logging.info("Adapting without phoneme objective.")
+            model = Loss(e2e, 0.5,
+                    phoneme_objective_weight=0.0,
+                    langs=langs)
+        else:
+            model = Loss(e2e, train_args.mtlalpha,
+                    phoneme_objective_weight=train_args.phoneme_objective_weight,
+                    langs=langs)
+
+        model.load_state_dict(torch.load(args.pretrained_model,
+                map_location=lambda storage, loc: storage))
+        logging.info("===MODEL OBJECTIVE WEIGHTS===")
+        logging.info("mtlalpha: {}".format(model.mtlalpha))
+        logging.info("phoneme_objective_weight: {}".format(model.phoneme_objective_weight))
+
+    else:
+        # specify model architecture
+        if args.phoneme_objective_weight > 0.0:
+            e2e = E2E(idim, grapheme_odim, args, phoneme_odim=phoneme_odim)
+        else:
+            e2e = E2E(idim, grapheme_odim, args)
+        model = Loss(e2e, args.mtlalpha, 
+                     phoneme_objective_weight=args.phoneme_objective_weight,
+                     langs=langs)
 
     if args.rnnlm is not None:
         rnnlm_args = get_model_conf(args.rnnlm, args.rnnlm_conf)
@@ -226,7 +435,7 @@ def train(args):
     model_conf = args.outdir + '/model.json'
     with open(model_conf, 'wb') as f:
         logging.info('writing a model config file to ' + model_conf)
-        f.write(json.dumps((idim, odim, vars(args)), indent=4, sort_keys=True).encode('utf_8'))
+        f.write(json.dumps((idim, grapheme_odim, phoneme_odim, vars(args)), indent=4, sort_keys=True).encode('utf_8'))
     for key in sorted(vars(args).keys()):
         logging.info('ARGS: ' + key + ': ' + str(vars(args)[key]))
 
@@ -243,6 +452,10 @@ def train(args):
     device = torch.device("cuda" if args.ngpu > 0 else "cpu")
     model = model.to(device)
 
+    #for parameter in model.parameters():
+    #    logging.info("Model parameter: {}".format(parameter))
+    logging.info("Model: {}".format(model))
+
     # Setup an optimizer
     if args.opt == 'adadelta':
         optimizer = torch.optim.Adadelta(
@@ -255,13 +468,8 @@ def train(args):
     setattr(optimizer, "serialize", lambda s: reporter.serialize(s))
 
     # Setup a converter
-    converter = CustomConverter(e2e.subsample[0])
-
-    # read json data
-    with open(args.train_json, 'rb') as f:
-        train_json = json.load(f)['utts']
-    with open(args.valid_json, 'rb') as f:
-        valid_json = json.load(f)['utts']
+    converter = CustomConverter(args.phoneme_objective_weight, langs,
+                                e2e.subsample[0])
 
     # make minibatch list (variable length)
     train = make_batchset(train_json, args.batch_size,
@@ -290,14 +498,18 @@ def train(args):
 
     # Set up a trainer
     updater = CustomUpdater(
-        model, args.grad_clip, train_iter, optimizer, converter, device, args.ngpu)
+        model, args.grad_clip, train_iter, optimizer, converter, device,
+        args.ngpu, args.epochs, predict_lang=args.predict_lang,
+        predict_lang_alpha=args.predict_lang_alpha,
+        predict_lang_alpha_scheduler=args.predict_lang_alpha_scheduler,
+        adapt=args.adapt)
     trainer = training.Trainer(
         updater, (args.epochs, 'epoch'), out=args.outdir)
 
     # Resume from a snapshot
     if args.resume:
         logging.info('resumed from %s' % args.resume)
-        torch_resume(args.resume, trainer)
+        torch_resume(args.resume, trainer, args.restore_trainer)
 
     # Evaluate the model with the test dataset for each epoch
     trainer.extend(CustomEvaluator(model, valid_iter, reporter, converter, device))
@@ -317,10 +529,13 @@ def train(args):
     # Make a plot for training and validation values
     trainer.extend(extensions.PlotReport(['main/loss', 'validation/main/loss',
                                           'main/loss_ctc', 'validation/main/loss_ctc',
-                                          'main/loss_att', 'validation/main/loss_att'],
+                                          'main/loss_att', 'validation/main/loss_att',
+                                          'main/loss_phn', 'validation/main/loss_phn'],
                                          'epoch', file_name='loss.png'))
     trainer.extend(extensions.PlotReport(['main/acc', 'validation/main/acc'],
                                          'epoch', file_name='acc.png'))
+    trainer.extend(extensions.PlotReport(['main/acc_lang', 'validation/main/acc_lang'],
+                                         'epoch', file_name='acc_lang.png'))
 
     # Save best models
     trainer.extend(extensions.snapshot_object(model, 'model.loss.best', savefun=torch_save),
@@ -382,12 +597,33 @@ def recog(args):
     torch.manual_seed(args.seed)
 
     # read training config
-    idim, odim, train_args = get_model_conf(args.model, args.model_conf)
+    try:
+        idim, grapheme_odim, phoneme_odim, train_args = get_model_conf(args.model, args.model_conf)
+    except ValueError:
+        # Couldn't find phoneme_odim
+        idim, grapheme_odim, train_args = get_model_conf(args.model, args.model_conf)
+        logging.info("train_args.phoneme_objective_weight: {}".format(train_args.phoneme_objective_weight))
+        if train_args.phoneme_objective_weight > 0.0:
+            phoneme_odim = 118
+        else:
+            phoneme_odim = -1
+
+    # read training json data just so we can extract the list of langs used in
+    # language ID prediction
+    if args.langs_file:
+        langs = set()
+        with open(args.langs_file) as f:
+            for line in f:
+                langs.add(line.strip())
+    else:
+        langs = None
 
     # load trained model parameters
     logging.info('reading model parameters from ' + args.model)
-    e2e = E2E(idim, odim, train_args)
-    model = Loss(e2e, train_args.mtlalpha)
+    e2e = E2E(idim, grapheme_odim, train_args, phoneme_odim=phoneme_odim)
+    model = Loss(e2e, train_args.mtlalpha, langs=langs)
+    #model = Loss(e2e, train_args.mtlalpha,
+    #             phoneme_objective_weight=args.phoneme_objective_weight)
     torch_load(args.model, model)
     e2e.recog_args = args
 
@@ -431,6 +667,58 @@ def recog(args):
     # read json data
     with open(args.recog_json, 'rb') as f:
         js = json.load(f)['utts']
+
+    if args.encoder_states:
+        logging.info("Storing encoder states.")
+
+        enc_states_dir = os.path.dirname(args.result_label) + "/encoder_states"
+        if not os.path.exists(enc_states_dir):
+            os.mkdir(enc_states_dir)
+
+        logging.info("per-frame-ali: {}".format(args.per_frame_ali))
+        per_frame_phns = defaultdict(list)
+        with open(args.per_frame_ali) as f:
+            for line in f:
+                sp = line.split()
+                assert len(sp) == 5
+                uttname = sp[0]
+                _conf = float(sp[1])
+                start = float(sp[2])
+                dur = float(sp[3])
+                phn = sp[4]
+                per_frame_phns[unicode(uttname)].append((start, dur, phn))
+
+        phn_units = []
+        with open(args.phoneme_dict, "r") as f:
+            for line in f:
+                phn_units.append(line.split()[0])
+
+        for uttname in list(per_frame_phns.keys())[:10]:
+            logging.info("{}: {}".format(uttname, per_frame_phns[uttname]))
+
+        NUM_ENCODER_STATES = None
+        #target_phns = ["a", "i", "o", "6",]# "u", "@", "E",]
+        #target_phns = phn_units
+        target_phns = ["A", "i"]
+        #target_langs = ["QEJLLB", "QUBPBS", "QUFLLB", "QVSTBL", "QVWTBL", "QWHLLB"]
+        target_langs = ["QEJLLB", "RUSS76", "NOGIBT"]
+        encoder_states = defaultdict(list)
+        uttids = defaultdict(list)
+        for uttname in js.keys():
+            lang = uttid2lang(uttname)
+            uttids[lang].append(uttname)
+        #for lang in uttids.keys():
+        for lang in target_langs:
+            #write_enc_states(lang, target_phns,
+            #                 js, uttids, per_frame_phns, e2e, train_args,
+            #                 enc_states_dir,
+            #                 num_encoder_states=NUM_ENCODER_STATES,
+            #                 request_vgg=args.request_vgg)
+            extract_phn_contexts(lang, target_phns, uttids, per_frame_phns, enc_states_dir)
+
+        return
+
+    # decode each utterance
     new_js = {}
 
     if args.batchsize is None:
@@ -439,7 +727,7 @@ def recog(args):
                 logging.info('(%d/%d) decoding ' + name, idx, len(js.keys()))
                 feat = kaldi_io_py.read_mat(js[name]['input'][0]['feat'])
                 nbest_hyps = e2e.recognize(feat, args, train_args.char_list, rnnlm)
-                new_js[name] = add_results_to_json(js[name], nbest_hyps, train_args.char_list)
+                new_js[name] = add_results_to_json(js[name], nbest_hyps, train_args.char_list, "grapheme")
     else:
         try:
             from itertools import zip_longest as zip_longest
@@ -464,8 +752,219 @@ def recog(args):
                 nbest_hyps = e2e.recognize_batch(feats, args, train_args.char_list, rnnlm=rnnlm)
                 for i, nbest_hyp in enumerate(nbest_hyps):
                     name = names[i]
-                    new_js[name] = add_results_to_json(js[name], nbest_hyp, train_args.char_list)
+                    new_js[name] = add_results_to_json(js[name], nbest_hyp, train_args.char_list, "grapheme")
+
+    if args.recog_phonemes:
+        assert args.phoneme_dict
+        with open(args.phoneme_dict) as f:
+            # The zero is because of the CTC blank symbol and because the
+            # phoneme inventory list starts indexing from 1.
+            phn_inv_list = [0]+[line.split()[0] for line in f.readlines()]
+
+            phn_output = get_output("phn", name, js)
+            if phn_output:
+                phn_out_dict = copy.deepcopy(phn_output)
+                phn_true = phn_out_dict["token"]
+                logging.info("ground truth phns: {}".format(phn_true))
+            else:
+                # Then there was no ground truth phonemes, so we create a new
+                # output.
+                phn_out_dict = {}
+                phn_out_dict["name"] = "phn"
+
+            # Then do basic one-best CTC phoneme decoding
+            phn_hyps = e2e.recognize_phn(feat)
+            phn_hat = [phn_inv_list[idx] for idx in phn_hyps]
+            logging.info("predicted phns: {}".format(phn_hat))
+
+            # Add phoneme-related info to the output JSON
+            phn_out_dict['rec_tokenid'] = " ".join([str(idx) for idx in phn_hyps])
+            phn_out_dict['rec_token'] = " ".join(phn_hat)
+
+            new_js[name]['output'].append(phn_out_dict)
 
     # TODO(watanabe) fix character coding problems when saving it
     with open(args.result_label, 'wb') as f:
-        f.write(json.dumps({'utts': new_js}, indent=4, sort_keys=True).encode('utf_8'))
+        f.write(json.dumps({'utts': new_js}, indent=4, sort_keys=True, ensure_ascii=False).encode('utf_8'))
+
+
+def trim_wav_sox(in_path, out_path, start_time, end_time):
+    """ Crops the wav file at in_fn so that the audio between start_time and
+    end_time is output to out_fn. Measured in milliseconds.
+    """
+
+    if out_path.is_file():
+        logger.info("Output path %s already exists, not trimming file", out_path)
+        return
+
+    #start_time_secs = millisecs_to_secs(start_time)
+    #end_time_secs = millisecs_to_secs(end_time)
+    start_time_secs = start_time
+    end_time_secs = end_time
+    args = [config.SOX_PATH, str(in_path), str(out_path),
+            "trim", str(start_time_secs), "=" + str(end_time_secs)]
+    logging.info("Cropping file %s, from start time %d (seconds) to end time %d (seconds), outputting to %s",
+                in_path, start_time_secs, end_time_secs, out_path)
+    subprocess.call(args, check=True)
+
+def extract_wav(uttid, lang, phn, start, dur, phn_index, enc_states_dir, pad=0.0):
+    """ Extract relevant part of the wav. """
+
+    in_path = ("/export/b15/oadams/datasets-CMU_Wilderness/" + lang +
+               "/aligned/wav/" + uttid + ".wav")
+    out_wav_dir = os.path.join(enc_states_dir, "wav")
+    if not os.path.isdir(out_wav_dir):
+        os.makedirs(out_wav_dir)
+    out_path = os.path.join(out_wav_dir,
+                            "lang-{}_phn-{}_pad{}_{}.wav".format(lang, phn,
+                            pad, phn_index))
+    logging.info("Extracting wav to {}".format(out_path))
+    args = ["sox", str(in_path), str(out_path),
+            "trim", str(start-pad), str(dur+2*pad)]
+    subprocess.check_output(args, stderr=subprocess.STDOUT)
+
+def extract_phn_contexts(lang, tgt_phns, uttids, per_frame_phns, enc_states_dir):
+    contexts = defaultdict(list)
+    for uttid in uttids[lang]:
+        if uttid in per_frame_phns:
+            phn_tuples = per_frame_phns[uttid]
+            phns = [phn for _, _, phn in phn_tuples]
+            for i in range(len(phns)):
+                if phns[i] in tgt_phns:
+                    num_sos_blanks = 0
+                    num_eos_blanks = 0
+                    start_i = i - 4
+                    end_i = i + 5
+                    if i < 4:
+                        num_sos_blanks = 4 - i
+                        start_i = 0
+                    if len(phns) - i - 1 < 4:
+                        num_eos_blanks = 4 - (len(phns) - i - 1)
+                        end_i = len(phns)
+                    contexts[phns[i]].append(
+                        num_sos_blanks*["<sos>"] +
+                        phns[start_i:end_i] +
+                        num_eos_blanks*["<eos>"])
+                    if num_sos_blanks > 0 or num_eos_blanks > 0:
+                        logging.info("---------------------------------------------")
+                        logging.info("phns: {}".format(phns))
+                        logging.info("context: {}".format(
+                            num_sos_blanks*["<sos>"] +
+                            phns[start_i:end_i] +
+                            num_eos_blanks*["<eos>"]))
+                        logging.info("i: {}".format(i))
+                        logging.info("phn: {}".format(phns[i]))
+
+    for tgt in contexts:
+        context_path = os.path.join(
+                enc_states_dir, "lang-{}_phn-{}_contexts.txt".format(lang, tgt))
+        with open(context_path, "w") as f:
+            for context in contexts[tgt]:
+                f.write(" ".join(context))
+                f.write("\n")
+
+def write_enc_states(lang, tgt_phns,
+                     js, uttids, per_frame_phns, e2e, train_args,
+                     enc_states_dir,
+                     num_encoder_states=500, request_vgg=False):
+    """ Writes the encoder states for a given language and phoneme. """
+
+    logging.info("extracting enc states for language {}".format(lang))
+    logging.info("target_phns: {}".format(tgt_phns))
+    encoder_states = defaultdict(list)
+    for uttid in uttids[lang]:
+        if uttid in per_frame_phns:
+            logging.info("uttid: {}".format(uttid))
+            feat = kaldi_io_py.read_mat(js[uttid]['input'][0]['feat'])
+            logging.info("feat.shape: {}".format(feat.shape))
+            logging.info("e2e.subsample: {}".format(e2e.subsample))
+            h, lens = e2e.encode_from_feat(feat, request_vgg=request_vgg)
+            logging.info("h.shape: {}".format(h.shape))
+            logging.info("lens: {}".format(lens))
+            logging.info("per_frame_phns: {}".format(
+                         per_frame_phns[uttid]))
+            logging.info("len(per_frame_phns): {}".format(
+                         len(per_frame_phns[uttid])))
+
+            phn_tuples = per_frame_phns[uttid]
+
+            # Get duration of the utterance
+            final_phn_start = per_frame_phns[uttid][-1][0]
+            final_phn_dur = per_frame_phns[uttid][-1][1]
+            utt_dur = final_phn_start + final_phn_dur
+            logging.info("utt_dir: {}".format(utt_dur))
+
+            for phn_tuple in phn_tuples:
+                start, dur, phn = phn_tuple
+                if phn in tgt_phns:
+                    # Midpoint of the phoneme in seconds
+                    phn_mid = start+(dur/2)
+                    logging.info("phn_mid of {} is {}".format(phn, phn_mid))
+                    logging.info("hlen is {}".format(h.shape[1]))
+                    # Turn that midpoint into an index in the encoder
+                    # states by scaling by the duration of the utterance
+                    h_i = int((phn_mid/utt_dur)*h.shape[1])
+                    logging.info("h_i is {}".format(h_i))
+                    len_enc_states = len(encoder_states[phn])
+                    if num_encoder_states:
+                        if len_enc_states < num_encoder_states:
+                            encoder_states[phn].append(h[0,h_i,:].detach().numpy())
+                            extract_wav(uttid, lang, phn, start, dur,
+                                        len_enc_states, enc_states_dir)
+                            extract_wav(uttid, lang, phn, start, dur,
+                                        len_enc_states, enc_states_dir,
+                                        pad=0.05)
+                            extract_wav(uttid, lang, phn, start, dur,
+                                        len_enc_states, enc_states_dir,
+                                        pad=0.1)
+                            extract_wav(uttid, lang, phn, start, dur,
+                                        len_enc_states, enc_states_dir,
+                                        pad=0.2)
+                            extract_wav(uttid, lang, phn, start, dur,
+                                        len_enc_states, enc_states_dir,
+                                        pad=0.4)
+                    else:
+                        encoder_states[phn].append(h[0,h_i,:].detach().numpy())
+                        extract_wav(uttid, lang, phn, start, dur,
+                                    len_enc_states, enc_states_dir)
+                        extract_wav(uttid, lang, phn, start, dur,
+                                    len_enc_states, enc_states_dir,
+                                    pad=0.05)
+                        extract_wav(uttid, lang, phn, start, dur,
+                                    len_enc_states, enc_states_dir,
+                                    pad=0.1)
+                        extract_wav(uttid, lang, phn, start, dur,
+                                    len_enc_states, enc_states_dir,
+                                    pad=0.2)
+                        extract_wav(uttid, lang, phn, start, dur,
+                                    len_enc_states, enc_states_dir,
+                                    pad=0.4)
+
+        done = True
+        for tgt in encoder_states:
+            logging.info("len(encoder_states[{}]): {}".format(
+                         tgt, len(encoder_states[tgt])))
+            if num_encoder_states:
+                if len(encoder_states[tgt]) != num_encoder_states:
+                    done = False
+            # If num_encoder_states is set to None, then done=True, then we just keep
+            # writing our matrix out for each utter.
+        if done:
+            for tgt in encoder_states:
+                #encoder_states[tgt] = np.array(encoder_states[tgt]).T
+                logging.info("writing encoder_states/{}_alpha{}beta{}_predict-lang-{}-{}_phn-{}_num{}_encoder_states.npy".format(lang,
+                train_args.mtlalpha, train_args.phoneme_objective_weight,
+                train_args.predict_lang, train_args.predict_lang_alpha_scheduler,
+                tgt, num_encoder_states))
+                #np.save("dev_encoder_states/{}_alpha{}beta{}_predict-lang-{}-{}_phn-{}_num{}_encoder_states".format(lang,
+                #train_args.mtlalpha, train_args.phoneme_objective_weight,
+                #train_args.predict_lang, train_args.predict_lang_alpha_scheduler,
+                #tgt, num_encoder_states), np.array(encoder_states[tgt]))
+                npy_path = os.path.join(
+                        enc_states_dir, "lang-{}_phn-{}".format(lang, tgt))
+                if request_vgg:
+                    npy_path = os.path.join(
+                            enc_states_dir, "lang-{}_phn-{}-vgg".format(lang, tgt))
+                np.save(npy_path, np.array(encoder_states[tgt]))
+            if num_encoder_states:
+                return
